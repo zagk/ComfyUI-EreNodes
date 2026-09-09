@@ -8,7 +8,7 @@ import server
 import folder_paths
 from aiohttp import web
 from safetensors import safe_open
-from .prompt_csv import CSV_FILES_PATH, TAG_DATA_CACHE
+from .prompt_csv import get_csv_path, invalidate_csv_caches, list_csv_files
 from .settings import get_erenodes_settings, save_erenodes_settings
 from . import paths
 from . import images
@@ -34,32 +34,42 @@ def sanitize_filename(filename):
     return filename.strip()
 
 
+# The only key this route writes; tag_groups.location has its own route, which validates it there.
+ALLOWED_SETTINGS = {"autocomplete.csv"}
+
+
+# The value must name a file list_csv_files would have offered.
+def _is_available_csv(value):
+    return get_csv_path(value) is not None
+
+
 @server.PromptServer.instance.routes.post("/erenodes/set_setting")
 async def set_setting_handler(request):
     data = await request.json()
     key = data.get("key")
     value = data.get("value")
 
-    if key is None:
-        return web.json_response({"status": "error", "message": "Setting 'key' not provided"}, status=400)
+    if key not in ALLOWED_SETTINGS:
+        return web.json_response({"status": "error", "message": f"Unknown setting: {key}"}, status=400)
+
+    if not _is_available_csv(value):
+        return web.json_response({"status": "error", "message": "Not an available CSV file"}, status=400)
 
     settings = get_erenodes_settings()
+    previous_value = settings.get(key)
     settings[key] = value
     save_erenodes_settings(settings)
 
-    # Invalidate the tag cache so it lazy-reloads on the next search.
+    # Invalidate both the previous and selected CSV so it lazy-reloads on the next search.
     if key == "autocomplete.csv":
-        TAG_DATA_CACHE.pop(value, None)
+        invalidate_csv_caches(previous_value)
+        invalidate_csv_caches(value)
 
     return web.json_response({"status": "ok"})
 
 @server.PromptServer.instance.routes.get("/erenodes/list_csv_files")
 async def list_csv_files_handler(request):
-    if not os.path.isdir(CSV_FILES_PATH):
-        return web.json_response([])
-    
-    files = [f for f in os.listdir(CSV_FILES_PATH) if f.endswith(".csv")]
-    return web.json_response(files)
+    return web.json_response(list_csv_files())
 
 # Report which of the given tags point at a file on disk.
 # Takes {"items": [{"name", "type", "extension"}]} and returns {"exists": {"<type>:<name>": bool}}, keyed as sent.
@@ -215,8 +225,21 @@ async def save_tag_group_handler(request):
 
 # Tag Group Location
 
+# The location the server actually resolved, so the settings combo can seed itself from it rather
+# than from its own default and immediately overwrite the answer.
+@server.PromptServer.instance.routes.get("/erenodes/tag_groups_location")
+async def get_tag_groups_location_handler(request):
+    location = paths.get_location()
+    return web.json_response({
+        "location": location,
+        "resolved": paths.dir_for_location(location),
+        # The node folder is offered only to installs already using it.
+        "legacy": location == paths.LOCATION_NODE,
+    })
+
+
 # Current location plus both resolved paths, so the settings UI can show where things actually are.
-# Switch between the two allowed roots. Keywords only: a different disk goes in extra_model_paths.yaml.
+# Switch between the allowed roots. Keywords only: a different disk goes in extra_model_paths.yaml.
 @server.PromptServer.instance.routes.post("/erenodes/set_tag_groups_location")
 async def set_tag_groups_location_handler(request):
     try:
@@ -711,6 +734,14 @@ def _build_tree(root, extensions, rel="", depth=0):
     except OSError:
         return {"folders": folders, "files": files}
 
+    # Which stems have a preview image beside them. The walk already has every entry in hand, so
+    # this costs a set build per directory and saves the client asking per file.
+    image_stems = set()
+    for entry in entries:
+        stem, ext = os.path.splitext(entry.name)
+        if ext.lower() in IMAGE_EXTENSIONS:
+            image_stems.add(stem[:-8] if stem.endswith(".preview") else stem)
+
     for entry in entries:
         name = entry.name
         child_rel = f"{rel}/{name}" if rel else name
@@ -734,6 +765,7 @@ def _build_tree(root, extensions, rel="", depth=0):
                 "path": os.path.splitext(child_rel)[0].replace(os.sep, '/'),
                 "extension": ext,
                 "type": "file",
+                "image": stem in image_stems,
             })
     return {"folders": folders, "files": files}
 

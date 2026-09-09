@@ -1,10 +1,28 @@
 import { app } from "../../../scripts/app.js";
 import { getCache, clearCache, beginUndoTransaction, endUndoTransaction } from "./util.js";
-import { renderTagPill, SURFACE_CLASS, injectTagStyles } from "./tagview.js";
+import { renderTagPill, SURFACE_CLASS, injectTagStyles, previewUrl } from "./tagview.js";
 import { showPreviewFor, hidePreviewPanel } from "./preview.js";
 
 // Class on preview <img> elements so cleanup can target them precisely.
 const PREVIEW_CLASS = "ere-menu-preview";
+
+/**
+ * Does this file already have a preview image? Only the wording of one menu entry depends on it
+ * ("Set" vs "Replace"), so the answer is memoised per file for the session — the sidebar gets the
+ * same fact for free from the tree walk, which is why only the node menus ask.
+ * `bumpPreview` moves the URL when a cover is written, so a stale "Set Image" cannot survive one.
+ */
+const previewProbes = new Map();
+async function hasPreviewImage(tag) {
+    if (!tag?.name || !['lora', 'embedding', 'group'].includes(tag.type)) return false;
+    const url = previewUrl(tag.type, tag.name);
+    if (!previewProbes.has(url)) {
+        previewProbes.set(url, fetch(url, { method: "HEAD" })
+            .then(r => r.ok && r.status !== 204)
+            .catch(() => false));
+    }
+    return previewProbes.get(url);
+}
 
 // Menus size to their content between these bounds.
 const MENU_MIN_WIDTH = 160;
@@ -398,6 +416,16 @@ export class DynamicContextMenu { // Added export
                     item.innerHTML = `<div>${displayHTML}</div>`;
                 } else {
                     item.innerHTML = "Error: Invalid option";
+                }
+
+                // The current value of a set of choices: marked at the far end, and not selectable
+                // — picking what is already picked is the one thing an entry cannot do.
+                if (option.checked) {
+                    item.classList.add("ere-menu-checked");
+                    const tick = document.createElement("span");
+                    tick.className = "ere-menu-tick";
+                    tick.textContent = "✓";
+                    item.appendChild(tick);
                 }
 
                 item.addEventListener("click", (e) => {
@@ -878,6 +906,8 @@ export class TagContextMenu extends DynamicContextMenu {
         this.existingTags = existingTags;
         this.currentWord = ""; 
         this.filterBox = null;
+        this.searchGeneration = 0;
+        this.searchAbortController = null;
         
         // Determine how to position the menu
         if (event instanceof MouseEvent) {
@@ -887,20 +917,46 @@ export class TagContextMenu extends DynamicContextMenu {
         }
     }
 
+    beginSearch() {
+        this.searchAbortController?.abort();
+        const controller = new AbortController();
+        this.searchAbortController = controller;
+        return {
+            generation: ++this.searchGeneration,
+            signal: controller.signal,
+        };
+    }
+
+    isCurrentSearch(generation) {
+        return generation === this.searchGeneration;
+    }
+
+    close(e = null, ignoreParent = false) {
+        this.searchGeneration++;
+        this.searchAbortController?.abort();
+        this.searchAbortController = null;
+        super.close(e, ignoreParent);
+    }
+
     async searchTags(query) {
         this.currentWord = query;
+        const { generation, signal } = this.beginSearch();
         let suggestions = [];
         try {
             // Per search, not cached: the menu outlives a settings change.
             const limit = app.ui?.settings?.getSettingValue?.("EreNodes.Autocomplete.Limit", 20) ?? 20;
             const response = await fetch(
-                `/erenodes/search_tags?query=${encodeURIComponent(query)}&limit=${limit}`);
+                `/erenodes/search_tags?query=${encodeURIComponent(query)}&limit=${limit}`,
+                { signal });
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
             const tags = await response.json();
             suggestions = tags.filter(tag => !this.existingTags.some(existingTag => existingTag.name === tag.name && existingTag.type === 'tag'));
         } catch (error) {
+            if (error.name === "AbortError" || !this.isCurrentSearch(generation)) return;
             console.error("[EreNodes] Error searching tags:", error);
         }
+
+        if (!this.isCurrentSearch(generation)) return;
         this.updateOptions(suggestions);
     }
     
@@ -1003,18 +1059,22 @@ export class TagIndexContextMenu extends TagContextMenu {
 
     async searchTags(query) {
         this.currentWord = query;
+        const { generation, signal } = this.beginSearch();
         let suggestions = [];
         try {
             const limit = app.ui?.settings?.getSettingValue?.("EreNodes.Autocomplete.Limit", 20) ?? 20;
             const params = new URLSearchParams({ query, limit: String(limit) });
             if (this.contextTerms?.length) params.set("context", this.contextTerms.join(","));
-            const response = await fetch(`/erenodes/tag_index/suggest?${params}`);
+            const response = await fetch(`/erenodes/tag_index/suggest?${params}`, { signal });
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
             const tags = await response.json();
             if (Array.isArray(tags)) suggestions = tags;
         } catch (error) {
+            if (error.name === "AbortError" || !this.isCurrentSearch(generation)) return;
             console.error("[EreNodes] Error suggesting tags:", error);
         }
+
+        if (!this.isCurrentSearch(generation)) return;
         this.updateOptions(suggestions);
     }
 }
@@ -1232,7 +1292,7 @@ export class TagEditContextMenu extends DynamicContextMenu {
 
         if (this.isSpecialType) {
             this.options.push({
-                name: "Set Image",
+                name: await hasPreviewImage(this.tag) ? "Replace Image" : "Set Image",
                 callback: () => this.setPreview()
             });
         }
@@ -1835,6 +1895,7 @@ export class ActionContextMenu extends DynamicContextMenu {
             this.options.push({
                 name: action.name,
                 disabled: !!action.disabled,
+                checked: !!action.checked,
                 submenu: action.submenu,
                 callback: () => {
                     this.close();
